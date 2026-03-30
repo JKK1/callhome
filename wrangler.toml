@@ -18,8 +18,3 @@ MAX_PAGES_PER_DAY        = "1000"
 # Per-IP rate limits
 RATE_LIMIT_CREATE_PER_HOUR = "5"
 RATE_LIMIT_READ_PER_MINUTE = "30"
-
-# Cron trigger: process the queue every day at 00:05 UTC
-# Calls POST /api/queue/process to promote queued entries to live pages.
-[[triggers.crons]]
-cron = "5 0 * * *"

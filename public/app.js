@@ -419,23 +419,72 @@ function renderSuccessPage(slug) {
   });
 }
 
-function renderQueuedPage(slug, position) {
+function renderQueuedPage(slug, initialPosition) {
   el('app').innerHTML = `
     <div class="card">
       <h1 class="card-title">You're in the queue</h1>
       <p class="card-subtitle">
-        The daily page limit has been reached. Your page has been queued and will be
-        created automatically when capacity opens up.
+        The service is at capacity. Your page will go live automatically
+        as soon as a slot opens up — no action needed.
       </p>
-      <div class="alert alert-info">
-        Queue position: <strong>#${escHtml(String(position))}</strong>.
-        Your URL <strong>/${escHtml(slug)}</strong> is reserved. Check back later.
+      <div class="alert alert-info" id="queue-status">
+        Queue position: <strong id="queue-pos">#${escHtml(String(initialPosition))}</strong>
+        &nbsp;<span id="queue-spinner" style="color:var(--gray-400);font-size:.85rem">· checking…</span>
       </div>
+      <p class="hint" style="margin-top:.5rem">
+        Your URL <strong>/${escHtml(slug)}</strong> is reserved.
+        This page refreshes automatically.
+      </p>
       <div class="btn-row">
         <a href="/" class="btn btn-secondary">Back to home</a>
       </div>
     </div>
   `;
+
+  let pollInterval = null;
+
+  async function pollQueue() {
+    try {
+      const { ok, data } = await apiFetch('GET', `/api/queue/${encodeURIComponent(slug)}`);
+      if (!ok) return;
+
+      if (data.status === 'ready') {
+        clearInterval(pollInterval);
+        el('app').innerHTML = `
+          <div class="card">
+            <h1 class="card-title">Your page is live!</h1>
+            <p class="card-subtitle">/${escHtml(slug)} is ready.</p>
+            <div class="url-box">
+              <span class="url-text">${escHtml(window.location.origin + '/' + slug)}</span>
+              <button class="copy-btn" id="copy-btn">Copy</button>
+            </div>
+            <div class="alert alert-info">Keep your password safe — it cannot be recovered.</div>
+            <div class="btn-row">
+              <a href="/${escHtml(slug)}" class="btn btn-primary">View page</a>
+              <a href="/" class="btn btn-secondary">Create another</a>
+            </div>
+          </div>
+        `;
+        el('copy-btn')?.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(window.location.origin + '/' + slug).catch(() => {});
+          el('copy-btn').textContent = 'Copied!';
+          setTimeout(() => { el('copy-btn').textContent = 'Copy'; }, 2000);
+        });
+        return;
+      }
+
+      if (data.status === 'queued' && data.position) {
+        const posEl = el('queue-pos');
+        if (posEl) posEl.textContent = `#${data.position}`;
+        const spinner = el('queue-spinner');
+        if (spinner) spinner.textContent = `· updated ${new Date().toLocaleTimeString()}`;
+      }
+    } catch { /* ignore network errors, keep polling */ }
+  }
+
+  // Poll immediately then every 5 seconds
+  pollQueue();
+  pollInterval = setInterval(pollQueue, 5000);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
