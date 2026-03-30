@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS contacts (
   iv          TEXT NOT NULL,
   data        TEXT NOT NULL,       -- AES-256-GCM ciphertext (base64)
   verifier    TEXT NOT NULL,       -- PBKDF2 write-auth hash (base64)
-  notify_topic TEXT,               -- ntfy.sh topic, nullable
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 );

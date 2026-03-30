@@ -12,6 +12,3 @@ CREATE TABLE IF NOT EXISTS queue (
 );
 
 CREATE INDEX IF NOT EXISTS idx_queue_day_pos ON queue (day_bucket, position);
-
--- Drop the notify_topic column from contacts (no longer used)
-ALTER TABLE contacts DROP COLUMN IF EXISTS notify_topic;
