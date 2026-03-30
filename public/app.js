@@ -73,9 +73,14 @@ async function decryptContacts(password, { salt, iv, data }) {
     { name: 'AES-GCM', iv: fromBase64(iv) }, key, fromBase64(data),
   );
   const parsed = JSON.parse(dec.decode(pt));
-  // Support both old single-contact format and new multi-contact format
-  if (Array.isArray(parsed.contacts)) return parsed.contacts;
-  return [parsed]; // legacy single contact
+  // Support old single-contact format
+  const contacts = Array.isArray(parsed.contacts) ? parsed.contacts : [parsed];
+  // Normalise phones/emails: old format was plain strings, new is {label, value}
+  return contacts.map(c => ({
+    ...c,
+    phones: (c.phones || []).map(p => typeof p === 'string' ? { label: '', value: p } : p),
+    emails: (c.emails || []).map(e => typeof e === 'string' ? { label: '', value: e } : e),
+  }));
 }
 
 // ── API ───────────────────────────────────────────────────────────────────────
@@ -138,9 +143,24 @@ function route() {
 // CONTACT FORM SECTIONS (shared by create + update)
 // ═══════════════════════════════════════════════════════════════════════════════
 
+function labeledRowHTML(type, entry, placeholder) {
+  // entry is {label, value} or empty defaults
+  const lbl = escHtml(entry?.label ?? '');
+  const val = escHtml(entry?.value ?? '');
+  const inp = type === 'tel'
+    ? `<input type="tel"   class="lv-value" value="${val}" placeholder="${placeholder}" />`
+    : `<input type="email" class="lv-value" value="${val}" placeholder="${placeholder}" />`;
+  return `
+    <div class="input-row">
+      <input type="text" class="lv-label" value="${lbl}" placeholder="Label" maxlength="30" />
+      ${inp}
+      <button type="button" class="remove-btn" aria-label="Remove">×</button>
+    </div>`;
+}
+
 function contactSectionHTML(index, contact = {}) {
-  const phones = contact.phones?.length ? contact.phones : [''];
-  const emails = contact.emails?.length ? contact.emails : [''];
+  const phones = contact.phones?.length ? contact.phones : [{ label: '', value: '' }];
+  const emails = contact.emails?.length ? contact.emails : [{ label: '', value: '' }];
   return `
     <div class="contact-section" data-index="${index}">
       <div class="contact-section-header">
@@ -156,7 +176,7 @@ function contactSectionHTML(index, contact = {}) {
       <div class="field">
         <label>Phone numbers</label>
         <div class="multi-field c-phones">
-          ${phones.map(p => `<div class="input-row"><input type="tel" value="${escHtml(p)}" placeholder="+1 555 000 0000" /></div>`).join('')}
+          ${phones.map(p => labeledRowHTML('tel', p, '+1 555 000 0000')).join('')}
         </div>
         <button type="button" class="add-btn add-phone-btn">+ Add phone</button>
       </div>
@@ -164,7 +184,7 @@ function contactSectionHTML(index, contact = {}) {
       <div class="field">
         <label>Email addresses</label>
         <div class="multi-field c-emails">
-          ${emails.map(e => `<div class="input-row"><input type="email" value="${escHtml(e)}" placeholder="you@example.com" /></div>`).join('')}
+          ${emails.map(e => labeledRowHTML('email', e, 'you@example.com')).join('')}
         </div>
         <button type="button" class="add-btn add-email-btn">+ Add email</button>
       </div>
@@ -194,37 +214,41 @@ function wireContactSections(container) {
     });
   });
 
+  // Wire existing remove buttons
+  container.querySelectorAll('.input-row .remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => btn.closest('.input-row').remove());
+  });
+
   // Add phone / add email buttons
   container.querySelectorAll('.add-phone-btn').forEach(btn => {
-    btn.addEventListener('click', () => addInputRow(btn.previousElementSibling, 'tel', '+1 555 000 0000', 5));
+    btn.addEventListener('click', () => addLabeledRow(btn.previousElementSibling, 'tel', '+1 555 000 0000', 5));
   });
   container.querySelectorAll('.add-email-btn').forEach(btn => {
-    btn.addEventListener('click', () => addInputRow(btn.previousElementSibling, 'email', 'you@example.com', 3));
+    btn.addEventListener('click', () => addLabeledRow(btn.previousElementSibling, 'email', 'you@example.com', 3));
   });
 }
 
-function addInputRow(list, type, placeholder, max) {
+function addLabeledRow(list, type, placeholder, max) {
   if (list.querySelectorAll('.input-row').length >= max) return;
-  const row = document.createElement('div');
-  row.className = 'input-row';
-  const inp = document.createElement('input');
-  inp.type = type; inp.placeholder = placeholder;
-  const removeBtn = document.createElement('button');
-  removeBtn.type = 'button'; removeBtn.className = 'remove-btn';
-  removeBtn.textContent = '×';
-  removeBtn.addEventListener('click', () => { row.remove(); });
-  row.appendChild(inp); row.appendChild(removeBtn);
+  const div = document.createElement('div');
+  div.innerHTML = labeledRowHTML(type, null, placeholder);
+  const row = div.firstElementChild;
+  row.querySelector('.remove-btn').addEventListener('click', () => row.remove());
   list.appendChild(row);
-  inp.focus();
+  row.querySelector('.lv-value').focus();
 }
 
 function readContactSection(section) {
-  const getVals = cls => [...section.querySelectorAll(`.${cls} .input-row input`)]
-    .map(i => i.value.trim()).filter(Boolean);
+  const getLabeledVals = cls =>
+    [...section.querySelectorAll(`.${cls} .input-row`)].map(row => ({
+      label: row.querySelector('.lv-label')?.value.trim() ?? '',
+      value: row.querySelector('.lv-value')?.value.trim() ?? '',
+    })).filter(e => e.value);
+
   return {
     name:    section.querySelector('.c-name').value.trim(),
-    phones:  getVals('c-phones'),
-    emails:  getVals('c-emails'),
+    phones:  getLabeledVals('c-phones'),
+    emails:  getLabeledVals('c-emails'),
     address: section.querySelector('.c-address').value.trim(),
     notes:   section.querySelector('.c-notes').value.trim().slice(0, 256),
   };
@@ -549,12 +573,14 @@ function showViewAlert(msg) {
 
 function renderContactCards(slug, contacts, password, updatedAt) {
   const cardsHtml = contacts.map((c, i) => {
-    const phones = (c.phones || []).map(p =>
-      `<li><span class="detail-icon">📞</span><a class="detail-link" href="tel:${escHtml(p)}">${escHtml(p)}</a></li>`
-    ).join('');
-    const emails = (c.emails || []).map(e =>
-      `<li><span class="detail-icon">✉️</span><a class="detail-link" href="mailto:${escHtml(e)}">${escHtml(e)}</a></li>`
-    ).join('');
+    const phones = (c.phones || []).map(p => {
+      const label = p.label ? `<span class="detail-label">${escHtml(p.label)}</span>` : '';
+      return `<li><span class="detail-icon">📞</span>${label}<a class="detail-link" href="tel:${escHtml(p.value)}">${escHtml(p.value)}</a></li>`;
+    }).join('');
+    const emails = (c.emails || []).map(e => {
+      const label = e.label ? `<span class="detail-label">${escHtml(e.label)}</span>` : '';
+      return `<li><span class="detail-icon">✉️</span>${label}<a class="detail-link" href="mailto:${escHtml(e.value)}">${escHtml(e.value)}</a></li>`;
+    }).join('');
     const address = c.address
       ? `<li><span class="detail-icon">📍</span><span class="detail-text">${escHtml(c.address)}</span></li>` : '';
     const notes = c.notes

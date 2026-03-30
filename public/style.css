@@ -316,6 +316,17 @@ textarea { resize: vertical; min-height: 88px; line-height: 1.55; }
 .multi-field { display: flex; flex-direction: column; gap: .5rem; }
 .input-row   { display: flex; gap: .5rem; align-items: center; }
 .input-row input { flex: 1; min-width: 0; }
+
+/* Labeled input rows (phone/email with optional label) */
+.lv-label {
+  width: 100px !important;
+  flex: 0 0 100px !important;
+  font-size: .85rem !important;
+  color: var(--gray-600) !important;
+}
+@media (max-width: 480px) {
+  .lv-label { width: 75px !important; flex: 0 0 75px !important; }
+}
 .remove-btn {
   flex-shrink: 0;
   background: none;
@@ -475,6 +486,15 @@ textarea { resize: vertical; min-height: 88px; line-height: 1.55; }
 .detail-link { color: var(--blue); text-decoration: none; word-break: break-all; }
 .detail-link:hover { text-decoration: underline; }
 .detail-text { color: var(--gray-700); white-space: pre-line; word-break: break-word; }
+.detail-label {
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--gray-400);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  margin-right: .4rem;
+  flex-shrink: 0;
+}
 
 .updated-at {
   font-size: .78rem;
