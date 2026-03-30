@@ -10,6 +10,7 @@ binding      = "DB"
 database_name = "callhome-db"
 database_id  = "b0cdbe84-6cd1-4ec1-8ea3-7a645c1dd812"
 
+
 [vars]
 # Global daily cap on new pages. Requests beyond this are queued.
 MAX_PAGES_PER_DAY        = "1000"
