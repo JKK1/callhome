@@ -615,6 +615,41 @@ textarea { resize: vertical; min-height: 88px; line-height: 1.55; }
 .how-it-works li div { font-size: .93rem; color: var(--gray-700); }
 .how-it-works li strong { display: block; color: var(--gray-900); font-size: .95rem; margin-bottom: .15rem; }
 
+/* ── Contact sections (multi-contact form) ──────────────────────────────────── */
+.contact-section {
+  border: 1px solid var(--gray-200);
+  border-radius: var(--radius);
+  padding: 1.25rem;
+  margin-bottom: 1rem;
+  background: var(--gray-50);
+}
+.contact-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+}
+.contact-section-title {
+  font-size: .8rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  color: var(--gray-400);
+}
+.remove-contact-btn {
+  background: none;
+  border: none;
+  font-size: .82rem;
+  color: var(--red);
+  cursor: pointer;
+  padding: .2rem .4rem;
+  border-radius: 5px;
+  font-family: inherit;
+}
+.remove-contact-btn:hover { background: #fef2f2; }
+
+.contact-card-extra { margin-top: 0 !important; }
+
 .oss-banner {
   background: linear-gradient(135deg, #1e3a5f 0%, #1d4ed8 100%);
   border-radius: var(--radius);

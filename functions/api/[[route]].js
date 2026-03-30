@@ -1,9 +1,11 @@
 // Cloudflare Pages Function — handles all /api/* routes
-// Uses Cloudflare D1 (SQLite) for relational storage.
+// Uses Cloudflare D1 (SQLite) for storage.
 //
-// D1 schema (see migrations/0001_init.sql):
-//   contacts(slug, salt, iv, data, verifier, notify_topic, created_at, updated_at)
-//   rate_limits(key, count, window_start)
+// Global limits:
+//   - MAX_PAGES_PER_DAY (default 1000): hard daily cap on new pages.
+//     If exceeded, creation requests are queued (stored in D1) and processed
+//     FIFO once the next UTC day begins.
+//   - Per-IP rate limits: 5 creates/hr, 30 reads/min.
 
 const RESERVED_SLUGS = new Set([
   'api', 'admin', 'www', 'mail', 'ftp', 'static', 'assets',
@@ -27,60 +29,86 @@ function err(message, status = 400) {
   return json({ error: message }, status);
 }
 
-// ── Rate limiting via D1 ──────────────────────────────────────────────────────
-// Each (type, ip, time-window) tuple gets a row. We increment atomically with
-// INSERT OR REPLACE … SELECT to stay race-safe within a single D1 write.
+function utcDayBucket() {
+  // Returns an integer YYYYMMDD for the current UTC day
+  const d = new Date();
+  return d.getUTCFullYear() * 10000 +
+         (d.getUTCMonth() + 1) * 100 +
+         d.getUTCDate();
+}
 
-async function checkRateLimit(db, type, ip, env) {
-  const createLimit = parseInt(env.RATE_LIMIT_CREATE_PER_HOUR ?? '5');
-  const readLimit   = parseInt(env.RATE_LIMIT_READ_PER_MINUTE ?? '30');
+// ── Global daily page limit ───────────────────────────────────────────────────
+// Uses a single row in rate_limits keyed "global:pages:{YYYYMMDD}".
+// Returns { allowed: bool, count: number, limit: number }
 
-  const windowSecs  = type === 'create' ? 3600 : 60;
-  const limit       = type === 'create' ? createLimit : readLimit;
-  const now         = Math.floor(Date.now() / 1000);
-  const bucket      = Math.floor(now / windowSecs);
-  const key         = `${type}:${ip}:${bucket}`;
+async function checkGlobalDailyLimit(db, env) {
+  const limit = parseInt(env.MAX_PAGES_PER_DAY ?? '1000');
+  const key   = `global:pages:${utcDayBucket()}`;
 
-  // Upsert: if row exists and is within window, increment; else start fresh.
   await db.prepare(`
     INSERT INTO rate_limits (key, count, window_start)
     VALUES (?, 1, ?)
     ON CONFLICT(key) DO UPDATE SET count = count + 1
-  `).bind(key, now).run();
+  `).bind(key, Math.floor(Date.now() / 1000)).run();
 
   const row = await db.prepare(
     'SELECT count FROM rate_limits WHERE key = ?'
   ).bind(key).first();
 
-  // Opportunistic cleanup of old rows (best-effort, non-blocking)
-  db.prepare(
-    'DELETE FROM rate_limits WHERE window_start < ?'
-  ).bind(now - windowSecs * 2).run().catch(() => {});
+  const count = row?.count ?? 1;
+  return { allowed: count <= limit, count, limit };
+}
+
+// ── Queue ─────────────────────────────────────────────────────────────────────
+// Queued entries sit in the `queue` table and are promoted to `contacts` by
+// the next /api/queue/process call (which can be triggered by a Cloudflare
+// Cron Trigger or manually).
+
+async function enqueue(db, slug, salt, iv, data, verifier) {
+  const now = new Date().toISOString();
+  // Get next queue position for today
+  const day = utcDayBucket();
+  const pos = await db.prepare(
+    'SELECT COUNT(*) as n FROM queue WHERE day_bucket = ?'
+  ).bind(day).first();
+  const position = (pos?.n ?? 0) + 1;
+
+  await db.prepare(`
+    INSERT INTO queue (slug, salt, iv, data, verifier, day_bucket, position, queued_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(slug, salt, iv, data, verifier, day, position, now).run();
+
+  return position;
+}
+
+// ── Per-IP rate limiting ──────────────────────────────────────────────────────
+
+async function checkRateLimit(db, type, ip, env) {
+  const createLimit = parseInt(env.RATE_LIMIT_CREATE_PER_HOUR ?? '5');
+  const readLimit   = parseInt(env.RATE_LIMIT_READ_PER_MINUTE ?? '30');
+
+  const windowSecs = type === 'create' ? 3600 : 60;
+  const limit      = type === 'create' ? createLimit : readLimit;
+  const bucket     = Math.floor(Date.now() / (windowSecs * 1000));
+  const key        = `${type}:${ip}:${bucket}`;
+
+  await db.prepare(`
+    INSERT INTO rate_limits (key, count, window_start)
+    VALUES (?, 1, ?)
+    ON CONFLICT(key) DO UPDATE SET count = count + 1
+  `).bind(key, Math.floor(Date.now() / 1000)).run();
+
+  const row = await db.prepare(
+    'SELECT count FROM rate_limits WHERE key = ?'
+  ).bind(key).first();
+
+  db.prepare('DELETE FROM rate_limits WHERE window_start < ?')
+    .bind(Math.floor(Date.now() / 1000) - windowSecs * 2).run().catch(() => {});
 
   return (row?.count ?? 1) <= limit;
 }
 
-// ── Notification (fire-and-forget) ────────────────────────────────────────────
-
-async function notify(topic, slug, action) {
-  if (!topic) return;
-  const messages = {
-    created: `Your CallHome page /${slug} is live. Share it with people who may need to reach you.`,
-    updated: `Your CallHome page /${slug} was just updated.`,
-  };
-  fetch(`https://ntfy.sh/${encodeURIComponent(topic)}`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'text/plain',
-      'Title': action === 'created' ? 'CallHome page created' : 'CallHome page updated',
-      'Priority': '3',
-      'Tags': 'phone',
-    },
-    body: messages[action] ?? `CallHome page /${slug} was modified.`,
-  }).catch(() => {});
-}
-
-// ── Constant-time string comparison ──────────────────────────────────────────
+// ── Constant-time comparison ──────────────────────────────────────────────────
 
 function safeCompare(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length) return false;
@@ -97,10 +125,9 @@ async function handleCheckSlug(db, slug) {
   if (!SLUG_RE.test(normalized) || RESERVED_SLUGS.has(normalized)) {
     return json({ available: false, reason: 'invalid' });
   }
-  const row = await db.prepare(
-    'SELECT slug FROM contacts WHERE slug = ?'
-  ).bind(normalized).first();
-  return json({ available: !row });
+  const inContacts = await db.prepare('SELECT slug FROM contacts WHERE slug = ?').bind(normalized).first();
+  const inQueue    = await db.prepare('SELECT slug FROM queue WHERE slug = ?').bind(normalized).first();
+  return json({ available: !inContacts && !inQueue });
 }
 
 async function handleCreate(request, db, ip, env) {
@@ -112,36 +139,43 @@ async function handleCreate(request, db, ip, env) {
   try { body = await request.json(); }
   catch { return err('Invalid JSON'); }
 
-  const { slug, salt, iv, data, verifier, notifyTopic } = body;
+  const { slug, salt, iv, data, verifier } = body;
 
   if (!slug || typeof slug !== 'string') return err('slug is required');
   const normalized = slug.toLowerCase().trim();
   if (!SLUG_RE.test(normalized)) {
     return err('Slug must be 3–50 characters: letters, numbers, hyphens, underscores only.');
   }
-  if (RESERVED_SLUGS.has(normalized)) return err('That slug is reserved. Choose another.');
+  if (RESERVED_SLUGS.has(normalized)) return err('That slug is reserved.');
   if (!salt || !iv || !data || !verifier)  return err('Missing encrypted payload fields.');
 
-  // Check availability
-  const existing = await db.prepare(
-    'SELECT slug FROM contacts WHERE slug = ?'
-  ).bind(normalized).first();
-  if (existing) return err('That URL is already taken. Choose a different one.', 409);
+  // Check availability across both tables
+  const existing = await db.prepare('SELECT slug FROM contacts WHERE slug = ?').bind(normalized).first();
+  if (existing) return err('That URL is already taken.', 409);
+  const queued = await db.prepare('SELECT slug FROM queue WHERE slug = ?').bind(normalized).first();
+  if (queued) return err('That URL is already in the queue.', 409);
+
+  // Check global daily limit
+  const { allowed, count, limit } = await checkGlobalDailyLimit(db, env);
+
+  if (!allowed) {
+    // Queue the request instead of rejecting
+    const position = await enqueue(db, normalized, salt, iv, data, verifier);
+    return json({ queued: true, slug: normalized, position }, 202);
+  }
 
   const now = new Date().toISOString();
   await db.prepare(`
-    INSERT INTO contacts (slug, salt, iv, data, verifier, notify_topic, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(normalized, salt, iv, data, verifier, notifyTopic ?? null, now, now).run();
-
-  notify(notifyTopic, normalized, 'created');
+    INSERT INTO contacts (slug, salt, iv, data, verifier, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(normalized, salt, iv, data, verifier, now, now).run();
 
   return json({ slug: normalized }, 201);
 }
 
 async function handleRead(request, db, ip, env, slug) {
   if (!await checkRateLimit(db, 'read', ip, env)) {
-    return err('Too many requests. Slow down and try again in a minute.', 429);
+    return err('Too many requests. Try again in a minute.', 429);
   }
 
   const row = await db.prepare(
@@ -150,13 +184,7 @@ async function handleRead(request, db, ip, env, slug) {
 
   if (!row) return err('Page not found.', 404);
 
-  // Return only what's needed for decryption — never expose verifier or notify_topic
-  return json({
-    salt:      row.salt,
-    iv:        row.iv,
-    data:      row.data,
-    updatedAt: row.updated_at,
-  });
+  return json({ salt: row.salt, iv: row.iv, data: row.data, updatedAt: row.updated_at });
 }
 
 async function handleUpdate(request, db, ip, env, slug) {
@@ -164,38 +192,6 @@ async function handleUpdate(request, db, ip, env, slug) {
     return err('Too many requests from your IP. Try again in an hour.', 429);
   }
 
-  const row = await db.prepare(
-    'SELECT verifier, notify_topic FROM contacts WHERE slug = ?'
-  ).bind(slug).first();
-  if (!row) return err('Page not found.', 404);
-
-  let body;
-  try { body = await request.json(); }
-  catch { return err('Invalid JSON'); }
-
-  const { verifier, salt, iv, data, newVerifier, notifyTopic } = body;
-  if (!verifier || !salt || !iv || !data) return err('Missing required fields.');
-
-  if (!safeCompare(verifier, row.verifier)) {
-    return err('Wrong password.', 403);
-  }
-
-  const updatedVerifier  = newVerifier   ?? row.verifier;
-  const updatedTopic     = notifyTopic !== undefined ? (notifyTopic || null) : row.notify_topic;
-  const now              = new Date().toISOString();
-
-  await db.prepare(`
-    UPDATE contacts
-    SET salt = ?, iv = ?, data = ?, verifier = ?, notify_topic = ?, updated_at = ?
-    WHERE slug = ?
-  `).bind(salt, iv, data, updatedVerifier, updatedTopic, now, slug).run();
-
-  notify(updatedTopic, slug, 'updated');
-
-  return json({ ok: true });
-}
-
-async function handleDelete(request, db, ip, slug) {
   const row = await db.prepare(
     'SELECT verifier FROM contacts WHERE slug = ?'
   ).bind(slug).first();
@@ -205,16 +201,74 @@ async function handleDelete(request, db, ip, slug) {
   try { body = await request.json(); }
   catch { return err('Invalid JSON'); }
 
-  const { verifier } = body;
-  if (!verifier) return err('Missing verifier.');
+  const { verifier, salt, iv, data, newVerifier } = body;
+  if (!verifier || !salt || !iv || !data) return err('Missing required fields.');
+  if (!safeCompare(verifier, row.verifier)) return err('Wrong password.', 403);
 
-  if (!safeCompare(verifier, row.verifier)) {
-    return err('Wrong password.', 403);
-  }
-
-  await db.prepare('DELETE FROM contacts WHERE slug = ?').bind(slug).run();
+  await db.prepare(`
+    UPDATE contacts SET salt = ?, iv = ?, data = ?, verifier = ?, updated_at = ? WHERE slug = ?
+  `).bind(salt, iv, data, newVerifier ?? row.verifier, new Date().toISOString(), slug).run();
 
   return json({ ok: true });
+}
+
+async function handleDelete(request, db, ip, slug) {
+  const row = await db.prepare('SELECT verifier FROM contacts WHERE slug = ?').bind(slug).first();
+  if (!row) return err('Page not found.', 404);
+
+  let body;
+  try { body = await request.json(); }
+  catch { return err('Invalid JSON'); }
+
+  const { verifier } = body;
+  if (!verifier) return err('Missing verifier.');
+  if (!safeCompare(verifier, row.verifier)) return err('Wrong password.', 403);
+
+  await db.prepare('DELETE FROM contacts WHERE slug = ?').bind(slug).run();
+  return json({ ok: true });
+}
+
+// ── Queue processing endpoint ─────────────────────────────────────────────────
+// Called by a Cloudflare Cron Trigger at midnight UTC (see wrangler.toml).
+// Promotes queued entries into contacts, up to today's daily limit.
+
+async function handleProcessQueue(db, env) {
+  const limit    = parseInt(env.MAX_PAGES_PER_DAY ?? '1000');
+  const today    = utcDayBucket();
+  const key      = `global:pages:${today}`;
+
+  const usedRow  = await db.prepare('SELECT count FROM rate_limits WHERE key = ?').bind(key).first();
+  const used     = usedRow?.count ?? 0;
+  const capacity = Math.max(0, limit - used);
+
+  if (capacity === 0) return json({ processed: 0, message: 'Daily limit already reached.' });
+
+  // Fetch oldest queued entries up to capacity, from any prior day
+  const entries = await db.prepare(`
+    SELECT slug, salt, iv, data, verifier FROM queue
+    WHERE day_bucket < ?
+    ORDER BY day_bucket ASC, position ASC
+    LIMIT ?
+  `).bind(today, capacity).all();
+
+  let processed = 0;
+  const now = new Date().toISOString();
+  for (const e of entries.results ?? []) {
+    // Skip if slug was taken since queueing
+    const existing = await db.prepare('SELECT slug FROM contacts WHERE slug = ?').bind(e.slug).first();
+    if (existing) {
+      await db.prepare('DELETE FROM queue WHERE slug = ?').bind(e.slug).run();
+      continue;
+    }
+    await db.prepare(`
+      INSERT INTO contacts (slug, salt, iv, data, verifier, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).bind(e.slug, e.salt, e.iv, e.data, e.verifier, now, now).run();
+    await db.prepare('DELETE FROM queue WHERE slug = ?').bind(e.slug).run();
+    processed++;
+  }
+
+  return json({ processed });
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
@@ -230,9 +284,12 @@ export async function onRequest(context) {
     ? params.route
     : (params.route ?? '').split('/').filter(Boolean);
 
-  if (route[0] !== 'contacts') {
-    return new Response('Not found', { status: 404 });
+  // /api/queue/process — triggered by Cron or manually
+  if (route[0] === 'queue' && route[1] === 'process' && method === 'POST') {
+    return handleProcessQueue(db, env);
   }
+
+  if (route[0] !== 'contacts') return new Response('Not found', { status: 404 });
 
   const slug = route[1]?.toLowerCase() ?? null;
 

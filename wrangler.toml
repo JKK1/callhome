@@ -1,15 +1,23 @@
-name = "callhome"
+name = "calling-home"
 compatibility_date = "2024-09-02"
 pages_build_output_dir = "public"
 
 # Cloudflare D1 — relational SQLite database
-# Create with: wrangler d1 create callhome-db
+# Create with: wrangler d1 create calling-home-db
 # Then replace the database_id value below
 [[d1_databases]]
-binding      = "DB"
-database_name = "callhome-db"
-database_id  = "YOUR_D1_DATABASE_ID"
+binding       = "DB"
+database_name = "calling-home-db"
+database_id   = "YOUR_D1_DATABASE_ID"
 
 [vars]
+# Global daily cap on new pages. Requests beyond this are queued.
+MAX_PAGES_PER_DAY        = "1000"
+# Per-IP rate limits
 RATE_LIMIT_CREATE_PER_HOUR = "5"
 RATE_LIMIT_READ_PER_MINUTE = "30"
+
+# Cron trigger: process the queue every day at 00:05 UTC
+# Calls POST /api/queue/process to promote queued entries to live pages.
+[[triggers.crons]]
+cron = "5 0 * * *"
